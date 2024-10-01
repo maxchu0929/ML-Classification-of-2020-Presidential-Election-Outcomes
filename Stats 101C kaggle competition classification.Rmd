@@ -1,0 +1,391 @@
+---
+title: "Stats 101C kaggle competition classification"
+author: "Maxwell Chu 405962883"
+date: "2024-07-30"
+output: pdf_document
+---
+
+```{r}
+library(reshape)
+library(tidyverse)
+library(tidymodels)
+library(xgboost)
+library(rpart)
+library(baguette)
+library(klaR)
+library(discrim)
+library(kernlab)
+library(future)
+
+tidymodels_prefer()
+```
+
+```{r}
+plan(multisession)
+```
+
+
+```{r}
+col_desc <- read.csv("col_descriptions.csv")
+train <- read.csv("train_class.csv")
+train <- train %>% select(-id, -name)
+test <- read.csv("test_class.csv")
+
+set.seed(4)
+train_folds <- vfold_cv(train, v = 5, strata = winner)
+```
+
+
+```{r}
+rf_model <- rand_forest(
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+rf_recipe <- recipe(winner ~ ., data = train) %>%
+  step_impute_median(contains("income"), contains("gdp")) %>%
+  step_num2factor(x2013_code)
+  
+rf_wflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(rf_recipe)
+
+rf_params <- extract_parameter_set_dials(rf_wflow) %>%
+  update(trees = deg_free(c(15, 400))) %>%
+  update(mtry = deg_free(c(15, 37))) %>%
+  update(min_n = deg_free(c(1, 25)))
+```
+
+```{r}
+# rf_fit <- rf_wflow %>% fit_resamples(resamples = train_folds)
+# rf_fit %>% collect_metrics()
+rf_tune_fit <- 
+  rf_wflow %>%
+  tune_grid(
+    resamples = train_folds,
+    # grid = grid_regular(rf_params, levels = 2)
+    grid = grid_random(rf_params, size = 100)
+  )
+```
+
+```{r}
+rf_res <- rf_tune_fit %>% show_best(n = 1000, metric = "accuracy")
+ggplot(data = rf_res) + geom_point(aes(x = min_n, y = mean))
+ggplot(data = rf_res) + geom_point(aes(x = mtry, y = mean))
+ggplot(data = rf_res) + geom_point(aes(x = trees, y = mean))
+rf_res
+```
+
+
+```{r}
+# ggplot(data = train) + geom_histogram(aes(x = income_per_cap_2016), bins = 50)
+# ggplot(data = train) + geom_histogram(aes(x = income_per_cap_2017))
+# ggplot(data = train) + geom_histogram(aes(x = income_per_cap_2018))
+# ggplot(data = train) + geom_histogram(aes(x = income_per_cap_2019))
+# ggplot(data = train) + geom_histogram(aes(x = income_per_cap_2020))
+
+train_gdp <- train %>% select(x0086e)
+summary(train_gdp)
+train_gdp <- melt(train_gdp)
+ggplot(aes(x = log(value), fill = variable), data = train_gdp) + geom_density(alpha = 0.25) #+ scale_x_continuous(limits = c(NA, 3000000))
+# mtry 14 min_n 1 trees 700
+```
+
+```{r}
+rf_best_model <- rf_tune_fit %>% select_best(metric = "accuracy")
+rf_final_wflow <- rf_wflow %>% finalize_workflow(rf_best_model)
+rf_final_fit <- rf_final_wflow %>% fit(data = train)
+rf_final_pred <- rf_final_fit %>% predict(new_data = test)
+rf_final_res <- bind_cols(id = test$id, winner = rf_final_pred$.pred_class)
+```
+
+```{r}
+rf_final_res
+write_csv(rf_final_res, "submission.csv")
+```
+
+```{r}
+bt_model <- boost_tree(
+  trees = tune(),
+  mtry = tune(),
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  sample_size = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+bt_recipe <- recipe(winner ~ ., data = train) %>%
+  step_impute_median(contains("income"), contains("gdp")) %>%
+  step_num2factor(x2013_code, levels = c("1", "2", "3", "4", "5", "6")) %>%
+  step_interact( ~ x2013_code:(total_votes:gdp_2020)) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+bt_wflow <- workflow() %>%
+  add_model(bt_model) %>%
+  add_recipe(bt_recipe)
+
+bt_params <- extract_parameter_set_dials(bt_wflow) %>%
+  update(mtry = finalize(mtry(), x = train %>% select(-winner))) %>%
+  update(trees = deg_free(c(5, 300))) %>%
+  update(min_n = deg_free(c(2, 5))) %>%
+  update(learn_rate = learn_rate(range = c(-1.6, -0.8))) %>%
+  update(tree_depth = deg_free(c(3, 15)))
+```
+
+
+```{r}
+# bt_fit <- bt_wflow %>% fit_resamples(resamples = train_folds)
+# bt_fit %>% collect_metrics()
+
+bt_tune_fit <-
+  bt_wflow %>%
+  tune_grid(
+    resamples = train_folds,
+    grid = grid_random(bt_params, size = 1)
+    # grid = grid_regular(bt_params, levels = 4)
+  )
+
+# bt_tune_bayes_fit <- 
+#   bt_wflow %>%
+#   tune_bayes(
+#     resamples = train_folds,
+#     param_info = bt_params,
+#     iter = 50,
+#     initial = bt_tune_fit,
+#     metrics = metric_set(roc_auc, accuracy),
+#     objective = exp_improve(trade_off = 0.02),
+#     control = control_bayes(uncertain = 3)
+#   )
+```
+
+```{r}
+bt_res <- bt_tune_fit %>% show_best(n = 1000, metric = "accuracy") #%>% filter(sample_size < 0.7)
+ggplot(data = bt_res) + geom_point(aes(x = mtry, y = mean))
+ggplot(data = bt_res) + geom_point(aes(x = min_n, y = mean))
+ggplot(data = bt_res) + geom_point(aes(x = trees, y = mean))
+ggplot(data = bt_res) + geom_point(aes(x = log10(learn_rate), y = mean))
+ggplot(data = bt_res) + geom_point(aes(x = sample_size, y = mean))
+bt_res
+
+```
+
+```{r}
+bt_best_model <- bt_tune_fit %>% select_best(metric = "roc_auc")
+bt_final_wflow <- bt_wflow %>% finalize_workflow(bt_best_model)
+bt_final_fit <- bt_final_wflow %>% fit(data = train)
+bt_final_pred <- bt_final_fit %>% predict(new_data = test)
+bt_final_res <- bind_cols(id = test$id, winner = bt_final_pred$.pred_class)
+```
+
+```{r}
+bt_final_res
+write_csv(bt_final_res, "submission.csv")
+```
+
+```{r}
+bt_model2 <- boost_tree(
+  trees = 175,
+  mtry = 75,
+  min_n = 3,
+  tree_depth = 11,
+  learn_rate = 0.04836553,
+  sample_size = 0.8887805) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+bt_recipe2 <- recipe(winner ~ ., data = train) %>%
+  step_impute_median(contains("income"), contains("gdp")) %>%
+  step_num2factor(x2013_code, levels = c("1", "2", "3", "4", "5", "6")) %>%
+  step_interact( ~ x2013_code:.) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+bt_wflow2 <- workflow() %>%
+  add_model(bt_model2) %>%
+  add_recipe(bt_recipe2)
+
+bt_fit2 <- bt_wflow2 %>% fit_resamples(resamples = train_folds, control = control_resamples(save_pred = TRUE))
+bt_fit2 %>% collect_metrics()
+bt_incorrect_pred <- bt_fit2 %>% collect_predictions() %>% filter(.pred_class != winner)
+bt_rows_incorrect <- bt_incorrect_pred$.row
+bt_rows_incorrect
+```
+
+
+```{r}
+bag_model <- bag_tree(
+  mode = "classification",
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  class_cost = tune(),
+  engine = "rpart"
+)
+
+bag_recipe <- recipe(winner ~ ., data = train) %>%
+  step_impute_median(contains("income"), contains("gdp")) %>%
+  step_log(all_numeric_predictors(), -x0018e, offset = 1)
+
+bag_wflow <- workflow() %>%
+  add_model(bag_model) %>%
+  add_recipe(bag_recipe)
+
+bag_params <- extract_parameter_set_dials(bag_wflow) %>%
+  update(tree_depth = deg_free(c(14, 15))) %>%
+  update(cost_complexity = cost_complexity(range = c(-10, -8.5))) %>%
+  update(min_n = deg_free(c(2, 15))) %>%
+  update(class_cost = class_cost(range = c(0.5, 1.5)))
+```
+
+```{r}
+bag_tune_fit <-
+  bag_wflow %>%
+  tune_grid(
+    resamples = train_folds,
+    grid = grid_random(bag_params, size = 20)
+    # grid = grid_regular(bt_params, levels = 4)
+  )
+```
+
+```{r}
+bag_res <- bag_tune_fit %>% show_best(n = 1000, metric = "accuracy")#  %>% filter(cost_complexity < 0.01)
+ggplot(data = bag_res) + geom_point(aes(x = log10(cost_complexity), y = mean))
+ggplot(data = bag_res) + geom_point(aes(x = tree_depth, y = mean))
+ggplot(data = bag_res) + geom_point(aes(x = min_n, y = mean))
+ggplot(data = bag_res) + geom_point(aes(x = class_cost, y = mean))
+bag_res
+```
+
+```{r}
+bag_best_model <- bag_tune_fit %>% select_best(metric = "accuracy")
+bag_final_wflow <- bag_wflow %>% finalize_workflow(bag_best_model)
+bag_final_fit <- bag_final_wflow %>% fit(data = train)
+bag_final_pred <- bag_final_fit %>% predict(new_data = test)
+bag_final_res <- bind_cols(id = test$id, winner = bag_final_pred$.pred_class)
+```
+
+```{r}
+bag_final_res
+write_csv(bag_final_res, "submission.csv")
+```
+
+```{r}
+nb_model <- naive_Bayes(
+  mode = "classification",
+  smoothness = tune(),
+  Laplace = tune(),
+  engine = "klaR"
+)
+nb_recipe <- recipe(winner ~ ., data = train) %>%
+  step_impute_median(contains("income"), contains("gdp")) %>%
+  step_log(all_numeric_predictors(), -x0018e, offset = 1) %>%
+  step_corr(all_numeric_predictors(), threshold = tune())
+
+nb_wflow <- workflow() %>%
+  add_model(nb_model) %>%
+  add_recipe(nb_recipe)
+
+nb_params <- extract_parameter_set_dials(nb_wflow) %>%
+  update(smoothness = smoothness(range = c(0.5, 0.575)))
+```
+
+```{r}
+nb_tune_fit <-
+  nb_wflow %>%
+  tune_grid(
+    resamples = train_folds,
+    grid = grid_random(nb_params, size = 30)
+    # grid = grid_regular(bt_params, levels = 4)
+  )
+```
+
+```{r}
+nb_res <- nb_tune_fit %>% show_best(n = 1000, metric = "accuracy")#  %>% filter(cost_complexity < 0.01)
+ggplot(data = nb_res) + geom_point(aes(x = Laplace, y = mean))
+ggplot(data = nb_res) + geom_point(aes(x = smoothness, y = mean))
+nb_res
+```
+
+```{r}
+nb_best_model <- nb_tune_fit %>% select_best(metric = "accuracy")
+nb_final_wflow <- nb_wflow %>% finalize_workflow(nb_best_model)
+nb_final_fit <- nb_final_wflow %>% fit(data = train)
+nb_final_pred <- nb_final_fit %>% predict(new_data = test)
+nb_final_res <- bind_cols(id = test$id, winner = nb_final_pred$.pred_class)
+```
+
+```{r}
+nb_final_res
+write_csv(nb_final_res, "submission.csv")
+```
+
+```{r}
+svm_model <- svm_rbf(
+  mode = "classification",
+  engine = "kernlab",
+  cost = tune(),
+  rbf_sigma = tune()
+)
+
+svm_recipe <- recipe(winner ~ ., data = train) %>%
+  step_impute_median(contains("income"), contains("gdp")) %>%
+  step_corr(all_numeric_predictors(), threshold = tune()) %>%
+  step_log(all_numeric_predictors(), offset = 1)
+
+svm_wflow <- workflow() %>%
+  add_model(svm_model) %>%
+  add_recipe(svm_recipe)
+
+svm_params <- extract_parameter_set_dials(svm_wflow)
+```
+
+```{r}
+# svm_fit <- svm_wflow %>% fit_resamples(resamples = train_folds)
+# svm_fit %>% collect_metrics()
+
+svm_tune_fit <-
+  svm_wflow %>%
+  tune_grid(
+    resamples = train_folds,
+    grid = grid_random(svm_params, size = 200)
+    # grid = grid_regular(bt_params, levels = 4)
+  )
+
+svm_tune_bayes_fit <-
+  svm_wflow %>%
+  tune_bayes(
+    resamples = train_folds,
+    param_info = svm_params,
+    iter = 30,
+    initial = svm_tune_fit,
+    metrics = metric_set(roc_auc, accuracy),
+    objective = exp_improve(trade_off = 0.05),
+    control = control_bayes(uncertain = 3)
+  )
+```
+
+```{r}
+svm_res <- svm_tune_fit %>% show_best(n = 1000, metric = "accuracy")#  %>% filter(cost_complexity < 0.01)
+ggplot(data = svm_res) + geom_point(aes(x = cost, y = mean))
+ggplot(data = svm_res) + geom_point(aes(x = rbf_sigma, y = mean))
+ggplot(data = svm_res) + geom_point(aes(x = threshold, y = mean))
+svm_res
+```
+
+```{r}
+svm_best_model <- svm_tune_fit %>% select_best(metric = "roc_auc")
+svm_final_wflow <- svm_wflow %>% finalize_workflow(svm_best_model)
+svm_final_fit <- svm_final_wflow %>% fit(data = train)
+svm_final_pred <- svm_final_fit %>% predict(new_data = test)
+svm_final_res <- bind_cols(id = test$id, winner = svm_final_pred$.pred_class)
+```
+
+```{r}
+svm_final_res
+write_csv(svm_final_res, "submission.csv")
+```
+
